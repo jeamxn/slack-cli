@@ -101,22 +101,45 @@ const merge = (into: Map<string, [string, string]>, from: Map<string, [string, s
 const DM_COOL_MS = 30 * 60_000;
 const URGENT_RE = /긴급|장애|롤백|지금\s*확인|전화/;
 
+const COOL_REASON = new Set(["followed", "thread", "@here", "edited", "group-dm", "dm"]);
+
 /**
- * A DM or group DM that keeps chatting while you stay quiet wakes the poller
- * at most once per 30 minutes; the rest piles up and is read together.
+ * A DM, or a normal-channel thread you only follow or that pinged @here, that
+ * keeps going while you stay quiet wakes the poller at most once per 30
+ * minutes (per DM, per thread); the rest piles up and is read together.
  * A direct mention or an urgent word breaks the wait.
  */
-const dmCooling = (db: Database, channelId: string, grade: string, self: string): boolean => {
-  if (grade !== "dm") return false;
-  const last = db
-    .query<{ at: number | null }, [string]>("SELECT MAX(at) AS at FROM wake_log WHERE channel_id = ?")
-    .get(channelId);
+const cooling = (
+  db: Database,
+  w: { channel_id: string; root_ts: string; grade: string; reason: string },
+  self: string,
+): boolean => {
+  const reasonList = w.reason.split(",").filter(Boolean);
+  const dm = w.grade === "dm";
+  const chatter = w.grade === "normal" && reasonList.every((r) => COOL_REASON.has(r));
+  if (!dm && !chatter) return false;
+  const last = dm
+    ? db
+        .query<{ at: number | null }, [string]>("SELECT MAX(at) AS at FROM wake_log WHERE channel_id = ?")
+        .get(w.channel_id)
+    : db
+        .query<{ at: number | null }, [string, string]>(
+          "SELECT MAX(at) AS at FROM wake_log WHERE channel_id = ? AND root_ts = ?",
+        )
+        .get(w.channel_id, w.root_ts);
   if (!last?.at || Date.now() - last.at >= DM_COOL_MS) return false;
-  const textList = db
-    .query<{ text: string }, [string, string, string]>(
-      "SELECT text FROM message WHERE channel_id = ? AND user <> ? AND deleted = 0 AND CAST(ts AS REAL) * 1000 > ?",
-    )
-    .all(channelId, self, String(last.at));
+  const textList = dm
+    ? db
+        .query<{ text: string }, [string, string, number]>(
+          "SELECT text FROM message WHERE channel_id = ? AND user <> ? AND deleted = 0 AND CAST(ts AS REAL) * 1000 > ?",
+        )
+        .all(w.channel_id, self, last.at)
+    : db
+        .query<{ text: string }, [string, string, string, number]>(
+          `SELECT text FROM message WHERE channel_id = ? AND thread_ts = ? AND user <> ? AND deleted = 0
+           AND CAST(ts AS REAL) * 1000 > ?`,
+        )
+        .all(w.channel_id, w.root_ts, self, last.at);
   return !textList.some(({ text }) => text.includes(`<@${self}>`) || URGENT_RE.test(text));
 };
 
@@ -169,7 +192,7 @@ export const settleAnswered = (inbox: Inbox): number => {
     )
     .all()
     .filter((w) => w.reason.split(",").some((r) => r && r !== "edited" && !quietSet.has(`${w.grade}:${r}`)))
-    .filter((w) => !dmCooling(db, w.channel_id, w.grade, self));
+    .filter((w) => !cooling(db, w, self));
   const top = waitList.reduce((max, w) => Math.max(max, w.seq), 0);
   const before = Number(getState(db, "wake_seq") ?? "0");
   if (top > before) {
